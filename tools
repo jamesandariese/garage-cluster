@@ -1,0 +1,250 @@
+#!/bin/bash
+
+set -e -o pipefail
+
+shq() {(
+  while [ $# -gt 0 ];do
+    echo -n "'$(echo -n "$1" | sed -e "s/'/'\"'\"'/g")'"
+    shift
+  done
+)}
+
+json() {( # json encode the argument
+  jq -n --arg v "$@" '$v'
+)}
+
+GARAGE_NAMESPACE="${GARAGE_NAMESPACE-garage}"
+
+ARGS="$(shq "$@")"
+ZERO="$0"
+ONE="$1"
+ONE_UNDER="$(echo -n "$ONE" | tr - _)"
+NL="$(echo)"
+
+enumerate_pods() { # enumerate kubernetes-based garage pods
+  kubectl get pod -n "$GARAGE_NAMESPACE" -l app=garage -o json | yq -ot '.items[] | [
+      .metadata.name,
+      .status.podIP,
+      .spec.containers[].ports[]|select(.name == "rpc")|.hostPort,
+      .spec.nodeName
+  ]' | while read -r pod ip port node;do
+      gnid="$(grun "$pod" node id -q)"
+      printf "%${#pod}s %25s %s\n" $pod $node "$gnid@$ip:$port"
+  done
+
+}
+
+get_ids() { # get the public id of all discoverable servers
+  enumerate_pods | while read -r pod node gnid;do
+    echo "$gnid"
+  done
+}
+
+iterstats() { # get stats from running garage nodes via iteration over discovered ids
+  get_ids | while read -r id;do
+    garage -h "$id" stats
+  done
+}
+
+grun() {
+  TARGET="$1"
+  shift
+  kubectl exec -n "$GARAGE_NAMESPACE" -c garage "$TARGET" -- garage "$@"
+}
+
+garage() { # run an arbitrary garage command via a random garage pod
+  grun ds/garage "$@"
+}
+
+generate_secrets() { # generates secrets required to run garage
+  kubectl create secret -n "$GARAGE_NAMESPACE" generic garage-secrets \
+    --from-literal=admin-token="$( openssl rand -base64 32 )" \
+    --from-literal=metrics-token="$( openssl rand -base64 32 )" \
+    --from-literal=rpc-secret="$( openssl rand -hex 32 )"
+}
+
+generate_layout() {( # generates a sample layout, (args are included verbatim, e.g. -t k8s)
+  enumerate_pods | while read -r pod node gnid;do
+  kubectl get node/$node -o json | jq -r --arg zero "$ZERO" --arg gnid "${gnid%%@*}" '
+    [
+      $zero,
+      "garage", "layout", "assign", $gnid,
+      "-t", .metadata.name,
+      "-c", "\((.metadata.labels["strudelline.net/garage-data-free-bytes"]//"10737418240")|tonumber/1024/1024/1024|floor)G"
+    ]+$ARGS.positional
+    | @sh' --args -- "$@" | while read -r cmd;do
+      eval "set $cmd"
+      printf " %q" "$@" | cut -c 2-
+    done
+  done
+)}
+
+generate_external_config() {( # generate a config for an external node
+  jq -rn \
+    --argjson secret "$(kubectl -n "$GARAGE_NAMESPACE" get secret garage-secrets -o json)" \
+    --argjson cm "$(kubectl -n "$GARAGE_NAMESPACE" get configmap garage-config -o json)" \
+    --argjson peers "$(get_ids | jq -R | jq -s)" \
+  '
+    # FUNCTIONS
+
+    def prettyjson:
+      if type != "array" then [tojson] else
+        if length < 2 then [tojson] else
+          [ (.[0]      | "[\n  \(tojson),\n")
+          , (.[1:-1][] | "  \(tojson),\n")
+          , (.[-1] | "  \(tojson)\n")
+          , "]"
+	  ]
+        end
+      end | add;
+
+    # gencfg: generates a toml line which will use a raw json value if possible or a string if not.
+    #         to guarantee a string, double encode it.
+    def gencfg:
+          ( (.value | fromjson?) // .value) as $v
+        | (if .key == "bootstrap_peers" then ($v + $peers) else ($v) end) as $v
+	| "\(.key) = \($v | prettyjson)";
+
+    # secval: get the value of the $secret, base64 decoded.
+    #         will emit 0 items (not an empty list!) if no matching key is found.
+    #         try jq -n "[[][],1,[][]]" (and figure it out) for a more clear understanding.
+    def secval($k): $secret.data | to_entries[] | select(.key == $k) | .value | @base64d;
+
+    # SETUP VARIABLES
+      [ $cm | .data | to_entries[]
+        , {"key": "rpc_secret", "value": secval("rpc-secret")}
+        , {"key": "admin.admin_token", "value": secval("admin-token")}
+        , {"key": "admin.metrics_token", "value": secval("metrics-token")}
+      ] | group_by(.key | test("[.]"))
+      as $asec
+    # data format now: [[{k,v},...],[{s.k,v},...]]
+    | $asec[0]
+      as $nsec
+    | [$asec[1][] | (.key | split(".")) as $k | {"section": $k[0], "key": $k[1], "value": .value}]
+      as $ysec
+    | [$ysec[] | .section] | unique
+      as $sections
+
+    | [][] # EMIT DATA -- [][] is to allow all outputs to start with ,
+
+    # emit unsectioned data
+    ,(
+      $nsec[] |
+      gencfg
+    )
+    # emit sectioned data
+    ,(
+      $sections[] as $section | (
+        "\n[\($section)]"
+        , ($ysec[] | select(.section == $section) | gencfg)
+      )
+    )
+  '
+)}
+
+get_host() { # get the base for URLs from the configured ingress
+  kubectl get ingress -n garage garage-web -o json | jq -r '
+    .spec.rules[].host | match("^[*].(.*)$") | .captures[0].string
+  ' | grep . || 1>&2 cat << EOF
+ERROR: you don't seem to have an ingress configured or it's not a wildcard.
+
+This tool requires you to have an
+ingress
+named garage-web
+in the garage namespace
+with a wildcard domain in a rule's host field.
+
+This will be returned without the *. attached so you may
+use it to add a subdomain-based bucket or use a path-based
+URL, as the situation demands.
+EOF
+}
+
+make_bucket() { # make a bucket along with metadata in a namespace
+  TARGETBUCKET="$1"
+  TARGETKEYNAME="${2-$TARGETBUCKET}-s3-app-key"
+  TARGETNS="${3-$TARGETBUCKET}"
+  TARGETSECRET="${3-$TARGETKEYNAME}"
+
+  kubectl get namespace "$TARGETNS" > /dev/null
+
+  garage bucket info "$TARGETBUCKET" || garage bucket create "$TARGETBUCKET"
+  eval "$(
+  (garage key info --show-secret "$TARGETKEYNAME" 2> /dev/null || garage key create "$TARGETKEYNAME") | awk '
+    /^Key ID: / {printf("KID=%s\n", $3);}
+    /^Secret key: / {printf("SK=%s\n", $3);}
+  ')"
+  garage bucket allow --read --write --owner "$TARGETBUCKET" --key "$TARGETKEYNAME"
+
+  kubectl create secret generic \
+    -n "$TARGETNS" "$TARGETSECRET" \
+    --type kubernetes.io/basic-auth \
+    --from-literal=username="$KID" \
+    --from-literal=password="$SK" \
+    --from-literal=AWS_ACCESS_KEY_ID="$KID" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="$SK" \
+    --from-literal=bucket="$TARGETBUCKET" \
+    --from-literal=url="https://$TARGETBUCKET.$(get_host)" \
+    --from-literal=hostport="$(get_host):443" \
+    --from-literal=host="$(get_host)" \
+    --from-literal=port="443" \
+    --from-literal=usessl="true" \
+    --from-literal=location="us-east-1" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+  kubectl label -n "$TARGETNS" secret/$TARGETSECRET bucket="$TARGETBUCKET" key="$TARGETKEYNAME"
+}
+
+connect() { # attempt to connect all nodes
+  allids="$(get_ids)"
+  primary="$(echo "$allids" | head -1)"
+  echo "$allids" | sed 1d | while read -r id;do
+    garage -h $primary node connect "$id"
+  done
+}
+
+env() { # generate alias to use cluster garage cli.
+  case "$1" in
+  bash | sh | zsh | '' )
+    printf "\nalias garage=%q\n" "$(printf "%q garage" "$PWD/tools")"
+    ;;
+  *)
+    1>&2 echo "unknown shell"
+    exit 1
+    ;;
+  esac
+}
+
+help() {( # this help
+  exec 1>&2
+
+  echo "usage: $0 <subcmd> [options]"
+  echo
+  echo GARAGE SUBCOMMANDS:
+  ( 2>&1 garage --help || true ) | awk 'p==1&&/^        / {print lc,$0;next} p==1 {lc=$1;print;} /^SUBCOMMANDS:$/ {p=1}' | while read -r cmd help;do
+    printf "  %-25s %s\n" "garage $cmd" "$help"
+  done
+  echo
+  echo "GARAGE CLUSTER TOOLS:"
+  grep -E "^[a-z_]+[(][)] {[(]? # .*" "$ZERO" | sed -Ee 's@[(][)] [{][(]? # @: @' |
+    while read cmd help;do
+      printf "  %-25s %s\n" "$(echo -n $cmd | tr _ -)" "$help"
+    done
+  echo
+)}
+
+if [ "x$1" = x ];then
+    help
+    exit 1
+fi
+
+# we translate - to _ to allow enumerate-pods or enumerate_pods.
+# it also changes -h to _h.
+
+if [ "x$ONE" = "x-h" ];then
+    help
+    exit 0
+fi
+
+shift 1
+"$ONE_UNDER" "$@"

@@ -1,0 +1,175 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  namespace: garage
+  name: garage
+  labels:
+    app: garage
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: garage
+  template:
+    metadata:
+      labels:
+        app: garage
+    spec:
+      terminationGracePeriodSeconds: 0
+      hostNetwork: true
+      imagePullSecrets:
+      - name: registry-auth
+      initContainers:
+      - name: config
+        restartPolicy: Always
+        image: strudelline.net/tools:latest
+        command: [bash, -c]
+        args:
+        - |
+          set -e
+
+          cd /config-in
+
+          # enumerate the global configs
+          # with the while loop, restartPolicy, and startupProbe: operate as a sidecar.
+          # this has a huge delay and probably isn't safe so it's disabled for now.
+          #while true;do
+            (
+              find . -maxdepth 1 -mindepth 1 -name '[a-z]*' -not -name '*.*' -print | (
+                while read -r f;do
+                  echo -n "${f#./} = "
+                  # if it's valid json, keep it that way (true/false, numbers, etc).
+                  # IF IT IS REQUIRED TO PASS "true" AS A STRING:
+                  #   put it in quoted quotes in the configmap like stupid_hostname: '"true"'
+                  jq . "$f" 2> /dev/null || jq -R . "$f"
+                done)
+              # enumerate the sectioned configs
+              find . -maxdepth 1 -mindepth 1 -name '[a-z]*.*' -not -name garage.toml -print | (
+                cut -c 3- | cut -d. -f1 |
+                sort | uniq | while read -r SECTION;do
+                  echo
+                  echo "[$SECTION]"
+                  for f in "$SECTION".*;do
+                    echo -n "${f#*.} = "
+                    # if it's valid json, keep it that way (true/false, numbers, etc).
+                    # IF IT IS REQUIRED TO PASS "true" AS A STRING:
+                    #   put it in quoted quotes in the configmap like stupid_hostname: '"true"'
+                    jq . "$f" 2> /dev/null || jq -R . "$f"
+                  done
+                done)
+            ) > /config/garage.toml
+            #) > /config/garage.toml.new
+            #if diff -Nq "/config/garage.toml.new" "/config/garage.toml";then
+            #  mv /config/garage.toml.new /config/garage.toml
+            #  echo "config settled."
+            #  inotifywait -r -t 30 /config-in
+            #else
+            #  mv /config/garage.toml.new /config/garage.toml
+            #  echo "rerunning shortly to settle config"
+            #  sleep 1
+            #fi
+          #done
+          while true;do
+            (
+              DD="$(cat data_dir)"
+              DDFREE="$(stat -fc "%a * %s" "$DD" | bc)"
+              echo "strudelline.net/garage-data-free-bytes"="$DDFREE"
+
+              MD="$(cat metadata_dir)"
+              MDFREE="$(stat -fc "%a * %s" "$MD" | bc)"
+              echo "strudelline.net/garage-meta-free-bytes"="$MDFREE"
+            ) | sponge /nfd-features-d/garage
+            cat /nfd-features-d/garage
+            echo "sleeping."
+            sleep 60
+          done
+        startupProbe:
+          exec:
+            command: [ grep, -q, "metadata_dir", /config/garage.toml ]
+          initialDelaySeconds: 1
+          periodSeconds: 1
+          failureThreshold: 20
+        volumeMounts:
+        - name: meta
+          mountPath: /var/lib/garage/meta
+        - name: data
+          mountPath: /var/lib/garage/data
+        - name: config-in
+          mountPath: /config-in
+        - name: config-xfr
+          mountPath: /config
+        - name: nfd-features-d
+          mountPath: /nfd-features-d
+        imagePullPolicy: Always
+      containers:
+      - image: dxflrs/garage:v1.1.0
+        name: garage
+        env:
+        - name: PATH
+          value: "/"
+        - name: GARAGE_ADMIN_TOKEN_FILE
+          value: /secrets/admin-token
+        - name: GARAGE_RPC_SECRET_FILE
+          value: /secrets/rpc-secret
+        - name: GARAGE_METRICS_TOKEN_FILE
+          value: /secrets/metrics-token
+        - name: GARAGE_CONFIG_FILE
+          value: /config/garage.toml
+        - name: GARAGE_ALLOW_WORLD_READABLE_SECRETS
+          value: "true"
+        ports:
+        - containerPort: 3900
+          name: s3-api
+        - containerPort: 3901
+          name: rpc
+        - containerPort: 3902
+          name: s3-web
+        - containerPort: 3903
+          name: admin-api
+        volumeMounts:
+        - name: meta
+          mountPath: /var/lib/garage/meta
+        - name: data
+          mountPath: /var/lib/garage/data
+        - name: config-xfr
+          mountPath: /config
+        - name: secrets
+          mountPath: /secrets
+        startupProbe:
+          httpGet:
+            path: /health
+            port: admin-api
+          initialDelaySeconds: 1
+          periodSeconds: 1
+          failureThreshold: 120
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: admin-api
+          initialDelaySeconds: 1
+          periodSeconds: 5
+          failureThreshold: 10
+      volumes:
+      - name: config-xfr
+        emptyDir: {}
+      - name: config-in
+        configMap:
+          name: garage-config
+      - name: meta
+        hostPath:
+          path: /var/lib/garage/meta
+          type: DirectoryOrCreate
+      - name: data
+        hostPath:
+          path: /var/lib/garage/data
+          type: DirectoryOrCreate
+      - name: secrets
+        secret:
+          secretName: garage-secrets
+      - name: nfd-features-d
+        hostPath:
+          path: /etc/kubernetes/node-feature-discovery/features.d
+          type: DirectoryOrCreate
+      restartPolicy: Always

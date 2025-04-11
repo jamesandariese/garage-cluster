@@ -1,0 +1,49 @@
+name: Update tags for docker image
+
+on:
+  push:
+    tags: ["*"]
+
+env:
+  REPO: ghcr.io
+  IMAGE_BASE: ghcr.io/jamesandariese/garage-cluster
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_USERNAME: ${{ github.actor }}
+      BUILDAH_ISOLATION: chroot
+      TZ: UTC
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: login to registry
+        run: |
+          buildah login -u "$GITHUB_USERNAME" -p "$GITHUB_TOKEN" "${IMAGE_BASE%%/*}"
+          echo "machine github.com login $GITHUB_USERNAME password $GITHUB_TOKEN" > $HOME/.netrc
+
+      - name: update image tags with git tag
+        run: |
+          set -x
+          COMMIT_DATE="$(git show --format=%cd -q --date format-local:%Y%m%d%H%M%S)"
+          TAGPART="${COMMIT_DATE}-${GITHUB_SHA:0:10}"
+          BTAG="b-${TAGPART}"
+          echo -n "checking for b-tag: "
+          while true;do
+            if skopeo list-tags docker://"$IMAGE_BASE" | jq --arg t "$BTAG" -e '[.Tags[] | select(. == $t)] | any';then
+              echo "found"
+              break
+            fi
+            echo "not found.  sleeping 10 seconds before retrying"
+            sleep 10
+          done
+          skopeo copy docker://$IMAGE_BASE:$BTAG docker://$IMAGE_BASE:$GITHUB_REF_NAME

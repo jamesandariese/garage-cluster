@@ -1,0 +1,34 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garage-web
+  namespace: garage
+spec:
+  ingressClassName: haproxy
+  tls:
+  - secretName: wildcard-tls
+    hosts:
+    - s3.strudelline.net
+    - '*.s3.strudelline.net'
+  rules:
+  - host: 's3.strudelline.net'
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: garage
+            port:
+              name: s3-api
+  - host: '*.s3.strudelline.net'
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: garage
+            port:
+              name: s3-api
