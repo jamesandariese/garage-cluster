@@ -1,0 +1,54 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: garage
+resources:
+- https://github.com/jamesandariese/garage-cluster
+patches:
+- patch: |-
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: garage-config
+    data:
+      s3_api.root_domain: ".s3.example.net"
+      s3_web.root_domain: ".web.example.net"
+      replication_factor: "3"
+      consistency_mode: "consistent"
+- target:
+    group: networking.k8s.io
+    version: v1
+    kind: Ingress
+    name: garage-web
+  patch: |-
+    - op: replace
+      path: /spec/tls/0/hosts
+      value: ['s3.example.net', '*.s3.example.net']
+    - op: replace
+      path: /spec/rules/0/host
+      value: 's3.example.net'
+    - op: replace
+      path: /spec/rules/1/host
+      value: '*.s3.example.net'
+- target:
+    group: networking.k8s.io
+    version: v1
+    kind: Ingress
+    name: direct-hosted-sites
+  patch: |-
+    # first, copy the template to as many as you need
+    - {op: "copy", path: "/spec/rules/1", from: "/spec/rules/0"}
+    - {op: "copy", path: "/spec/rules/2", from: "/spec/rules/0"}
+
+    # make your modifications
+    - op: replace
+      path: '/spec/rules/1/host'
+      value: 'example.net'
+    - op: replace
+      path: '/spec/rules/2/host'
+      value: 'example.com'
+    - op: replace
+      path: '/spec/tls/0/hosts'
+      value: ['example.net', 'example.com']
+
+    # and finally, delete the template
+    - {op: "remove", path: "/spec/rules/0"}

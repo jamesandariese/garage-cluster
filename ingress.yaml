@@ -1,0 +1,33 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garage-web
+spec:
+  ingressClassName: haproxy
+  tls:
+  - secretName: wildcard-tls
+    hosts:
+    - 's3.does.not.exist'
+    - '*.s3.does.not.exist'
+  rules:
+  - host: 's3.does.not.exist'
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: garage
+            port:
+              name: s3-api
+  - host: '*.s3.does.not.exist'
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: garage
+            port:
+              name: s3-api

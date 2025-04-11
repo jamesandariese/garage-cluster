@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+data:
+  metadata_dir: "/var/lib/garage/meta"
+  data_dir: "/var/lib/garage/data"
+  rpc_bind_addr: "[::]:3901"
+
+  replication_factor: "3"
+  consistency_mode: "consistent"
+
+  bootstrap_peers: |
+    []
+
+  s3_api.s3_region: "us-east-1"
+  s3_api.api_bind_addr: "[::]:3900"
+  s3_api.root_domain: ".s3.does.not.exist"
+
+  s3_web.bind_addr: "[::]:3902"
+  s3_web.root_domain: ".web.does.not.exist"
+  s3_web.add_host_to_metrics: "true"
+
+  admin.api_bind_addr: "[::]:3903"

@@ -1,0 +1,24 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    haproxy-ingress.github.io/path-type: regex
+  name: direct-hosted-sites
+spec:
+  ingressClassName: haproxy
+  tls:
+  - secretName: wildcard-tls
+    hosts:
+    - 'www.does.not.exist'
+  rules:
+  - host: 'www.does.not.exist'
+    http:
+      paths:
+      - path: /([^/]+.html)?$
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: garage
+            port:
+              name: s3-web

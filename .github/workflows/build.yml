@@ -1,0 +1,52 @@
+name: Create and publish docker image
+
+on:
+  push:
+    branches: ["*"]
+
+env:
+  REPO: ghcr.io
+  IMAGE_BASE: ghcr.io/jamesandariese/garage-cluster
+  TZ: UTC
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_USERNAME: ${{ github.actor }}
+      BUILDAH_ISOLATION: chroot
+
+    steps:
+      - name: login to github
+        run: |
+          buildah login -u "$GITHUB_USERNAME" -p "$GITHUB_TOKEN" "${IMAGE_BASE%%/*}"
+          echo "machine github.com login $GITHUB_USERNAME password $GITHUB_TOKEN" > $HOME/.netrc
+
+      - uses: actions/checkout@v3
+
+      - name: setup environment
+        run: |
+          saveEnv() { while [ $# -gt 0 ];do printf "%s=%q\n" "${1}" "${!1}" >> $GITHUB_ENV;shift;done; }
+
+          COMMIT_DATE="$(git show --format=%cd -q --date format-local:%Y%m%d%H%M%S)"
+          TAGPART="${COMMIT_DATE}-${GITHUB_SHA:0:10}"
+          TAG="${GITHUB_REF_NAME}-${TAGPART}"
+          BTAG="b-${TAGPART}"
+          SENTRY_RELEASE="$BTAG"
+
+          saveEnv TAG BTAG SENTRY_RELEASE
+
+      - name: build docker image
+        run: |
+          buildah bud -t "$IMAGE_BASE:$TAG"
+
+      - name: push image to tag and copy to btag
+        run: |
+          buildah push "$IMAGE_BASE:$TAG"
+          skopeo copy docker://$IMAGE_BASE:$TAG docker://$IMAGE_BASE:$BTAG
