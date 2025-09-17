@@ -68,6 +68,7 @@ To create a Garage cluster, you must do the following:
 
 * Apply the manifests:
 
+      ./tools generate-secrets
       kubectl apply -k .
       echo "Ctrl-C to exit"
       kubectl get ds -n garage -w
